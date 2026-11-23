@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from .engine import (
     DEFAULT_MAX_PENDING,
     DEFAULT_QUEUES,
+    DEFAULT_SUMMARY_SIZE,
     InvalidPacketError,
     SwitchEngine,
     UnknownFlowError,
@@ -35,6 +36,9 @@ from .models import (
     SwitchResponse,
     StateResponse,
 )
+from .store import DeliveryStore, StoreError
+
+DEFAULT_STORE_PATH = os.path.join("data", "deliveries.db")
 
 DESCRIPTION = """
 模拟网卡换接收队列时的乱序，并验证**每条流按收包顺序交付**。
@@ -46,6 +50,12 @@ DESCRIPTION = """
 * 每条流最多积压 `MAX_PENDING_PER_FLOW`（默认 4）个已接收但未交付的包，
   满了只拒收这一流的新包；推进队列腾出位置后可以重试。
 * 任意队列可以单独推进，接收队列可以反复切换。
+* 逐包交付记录整批写入本地磁盘（`DELIVERY_STORE_PATH`），每条流在内存
+  只留固定大小（`DELIVERY_SUMMARY_SIZE`）的交付摘要；`/egress` 等查询
+  的字段、范围和顺序不变，数据从磁盘读取。
+* 推进时写盘失败会报错（500），整批报文留在各自的接收队列，写盘恢复后
+  重试即可，交付序号接着上次成功记录；重置或进程重启后历史清空，
+  交付序号从 1 重新开始。
 """
 
 
@@ -63,7 +73,11 @@ def _int_env(name: str, default: int) -> int:
 
 
 def create_app(
-    queues: Optional[int] = None, max_pending: Optional[int] = None
+    queues: Optional[int] = None,
+    max_pending: Optional[int] = None,
+    summary_size: Optional[int] = None,
+    store_path: Optional[str] = None,
+    store: Optional[DeliveryStore] = None,
 ) -> FastAPI:
     n_queues = queues if queues is not None else _int_env("QUEUES", DEFAULT_QUEUES)
     capacity = (
@@ -71,11 +85,23 @@ def create_app(
         if max_pending is not None
         else _int_env("MAX_PENDING_PER_FLOW", DEFAULT_MAX_PENDING)
     )
-    engine = SwitchEngine(queues=n_queues, max_pending=capacity)
+    summary = (
+        summary_size
+        if summary_size is not None
+        else _int_env("DELIVERY_SUMMARY_SIZE", DEFAULT_SUMMARY_SIZE)
+    )
+    if store is None:
+        store = DeliveryStore(
+            store_path or os.getenv("DELIVERY_STORE_PATH") or DEFAULT_STORE_PATH
+        )
+    engine = SwitchEngine(
+        queues=n_queues, max_pending=capacity, summary_size=summary, store=store
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
+        engine.close()
 
     app = FastAPI(
         title="网卡接收队列切换演练",
@@ -100,6 +126,10 @@ def create_app(
     @app.exception_handler(InvalidPacketError)
     async def _invalid_packet(request: Request, exc: InvalidPacketError):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(StoreError)
+    async def _store_error(request: Request, exc: StoreError):
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     # ------------------------------------------------------------------ 页面
     @app.get("/", include_in_schema=False)
@@ -178,6 +208,9 @@ def create_app(
         response_model=DeliverResponse,
         tags=["操作"],
         summary="单独推进一条队列，交付当前可交付的报文",
+        responses={
+            500: {"description": "交付记录写盘失败，整批报文仍留在接收队列"},
+        },
     )
     def advance_queue(queue_id: int, body: Optional[DeliverRequest] = None) -> dict:
         count = body.count if body is not None else 1
@@ -185,6 +218,14 @@ def create_app(
             outcome = engine.deliver(queue_id, count=count)
         except UnknownQueueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{exc}；本次整批报文仍留在各自的接收队列，"
+                    "其他队列的同流后续包继续等候，写盘恢复后重试即可"
+                ),
+            ) from exc
         return {
             "queue_id": outcome.queue_id,
             "delivered": [
@@ -224,9 +265,13 @@ def create_app(
         response_model=ResetResponse,
         tags=["运维"],
         summary="清空所有队列、流和交付记录，恢复初始状态",
+        responses={500: {"description": "清空磁盘上的交付记录失败"}},
     )
     def reset() -> ResetResponse:
-        engine.reset()
+        try:
+            engine.reset()
+        except StoreError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return ResetResponse()
 
     return app

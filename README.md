@@ -13,7 +13,10 @@ docker compose up --build
 ```
 
 可用环境变量：`PORT`（宿主端口，默认 8000）、`QUEUES`（队列数，默认 2）、
-`MAX_PENDING_PER_FLOW`（每条流积压上限，默认 4）。
+`MAX_PENDING_PER_FLOW`（每条流积压上限，默认 4）、`DELIVERY_SUMMARY_SIZE`
+（每条流在内存里保留的交付摘要大小，默认 8）、`DELIVERY_STORE_PATH`
+（交付记录库文件路径，容器里默认 `/data/deliveries.db`，本地直接跑默认
+`./data/deliveries.db`）。
 
 ```bash
 PORT=9000 QUEUES=3 MAX_PENDING_PER_FLOW=8 docker compose up --build
@@ -79,6 +82,23 @@ curl -s 'localhost:8000/egress?flow_id=web'
 重复包（已在积压或已交付）返回 409；包号小于已交付包号的过期包也返回 409；
 队列编号越界返回 404；参数不合法返回 422。
 
+## 交付记录落盘
+
+跑久了内存不会涨：逐包交付记录（全局交付序号、流、包号、来源队列）整批写入
+本地磁盘的 SQLite 库（`DELIVERY_STORE_PATH`），每条流在内存只留固定大小
+（`DELIVERY_SUMMARY_SIZE`）的交付摘要。`/state`、`/egress`、`/flows/{id}`
+等查询的字段、范围和顺序不变，只是数据改从磁盘读；`GET /egress?flow_id=`
+仍只取该流的记录。判断重复包/过期包时，摘要窗口里找不到的老包会回查磁盘。
+
+| 规则 | 实现 |
+| --- | --- |
+| 推进先写盘再改内存 | 一批交付记录事务落盘成功后，报文才从接收队列移除 |
+| 写盘失败就报错 | 推进返回 500，整批包留在各自的接收队列，其他队列的同流后续包继续等候 |
+| 恢复后可重试 | 重新推进即可，交付序号接着上次成功落盘的记录 |
+| 未提交不影响查询 | 写盘尚未提交时，`/egress` 仍返回此前成功的交付记录 |
+| 暂存状态有界 | 为恢复暂存的状态只随本批涉及的流和报文增长，写盘成功即清空 |
+| 重置/重启清历史 | `/reset` 或进程重启后交付记录清空，交付序号从 1 重新开始 |
+
 ## 测试
 
 ```bash
@@ -86,13 +106,15 @@ pip install -r requirements.txt pytest httpx
 python3 -m pytest -q
 ```
 
-`tests/test_engine.py` 覆盖状态机，「`tests/test_api.py`」覆盖 HTTP 接口与 /docs。
+`tests/test_engine.py` 覆盖状态机，`tests/test_store.py` 覆盖交付记录落盘、
+内存摘要与写盘失败恢复，`tests/test_api.py` 覆盖 HTTP 接口与 /docs。
 
 ## 目录
 
 ```
 app/
   engine.py   核心状态机：接收、积压上限、按流保序交付
+  store.py    逐包交付记录的本地磁盘存储（SQLite）
   models.py   Pydantic 模型（带 /docs 示例）
   main.py     FastAPI 路由
 tests/

@@ -8,4 +8,12 @@ services:
     environment:
       QUEUES: "${QUEUES:-2}"
       MAX_PENDING_PER_FLOW: "${MAX_PENDING_PER_FLOW:-4}"
+      DELIVERY_SUMMARY_SIZE: "${DELIVERY_SUMMARY_SIZE:-8}"
+      DELIVERY_STORE_PATH: "${DELIVERY_STORE_PATH:-/data/deliveries.db}"
+    volumes:
+      # 逐包交付记录落盘的位置；进程重启后历史会清空，卷只给库文件一个稳定的家
+      - delivery-store:/data
     restart: unless-stopped
+
+volumes:
+  delivery-store:

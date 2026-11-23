@@ -42,7 +42,9 @@ class StreamSnapshot(BaseModel):
     pending_count: int = Field(..., ge=0)
     capacity: int = Field(..., ge=1, description="每条流允许的最大积压数")
     waiting_behind_head: int = Field(..., ge=0, description="队头之后的包，正等候交付")
-    delivered: List[int] = Field(..., description="已按顺序交付给上层的包号")
+    delivered: List[int] = Field(
+        ..., description="已按顺序交付给上层的包号（完整记录存在磁盘上，按交付顺序返回）"
+    )
     next_expected: Optional[int] = None
     rejected: int = Field(..., ge=0, description="因积压满额被拒收的包数")
     duplicate_attempts: int = Field(..., ge=0)
@@ -84,7 +86,7 @@ class EgressRecord(BaseModel):
         }
     )
 
-    order: int = Field(..., ge=1, description="上层收到的全局顺序号")
+    order: int = Field(..., ge=1, description="上层收到的全局顺序号（记录存在磁盘上）")
     flow_id: str
     seq: int
     queue_id: int

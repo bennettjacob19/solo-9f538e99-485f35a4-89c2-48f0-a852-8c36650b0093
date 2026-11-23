@@ -4,13 +4,37 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.store import DeliveryStore, StoreError
+
+
+class FlakyStore(DeliveryStore):
+    """可通过开关模拟写盘失败的存储。"""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.fail_writes = False
+
+    def append_batch(self, rows):
+        if self.fail_writes:
+            raise StoreError("模拟写盘失败：磁盘不可用")
+        return super().append_batch(rows)
 
 
 @pytest.fixture()
-def client():
-    app = create_app(queues=2, max_pending=4)
+def client(tmp_path):
+    app = create_app(
+        queues=2, max_pending=4, store_path=str(tmp_path / "deliveries.db")
+    )
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture()
+def flaky(tmp_path):
+    store = FlakyStore(str(tmp_path / "deliveries.db"))
+    app = create_app(queues=2, max_pending=4, store=store)
+    with TestClient(app) as c:
+        yield c, store
 
 
 def send(client, flow_id, seq, queue_id):
@@ -183,3 +207,85 @@ def test_reset(client):
     client.post("/reset")
     assert client.get("/egress").json()["egress"] == []
     assert client.get("/state").json()["streams"] == []
+
+
+def test_reset_restarts_delivery_order(client):
+    send(client, "f1", 1, 0)
+    advance(client, 0)
+    assert client.post("/reset").status_code == 200
+    send(client, "f1", 1, 0)
+    advance(client, 0)
+    # 重置后历史清空，交付序号从 1 重新开始
+    assert client.get("/egress").json()["egress"] == [
+        {"order": 1, "flow_id": "f1", "seq": 1, "queue_id": 0}
+    ]
+
+
+def test_egress_reads_full_history_from_disk(client):
+    # 交付得比内存摘要窗口还久，/egress 仍返回完整有序的记录
+    for seq in range(1, 21):
+        send(client, "f1", seq, 0)
+        advance(client, 0)
+    records = client.get("/egress").json()["egress"]
+    assert [r["order"] for r in records] == list(range(1, 21))
+    assert [r["seq"] for r in records] == list(range(1, 21))
+    # 按流查只取该流的记录
+    send(client, "f2", 1, 0)
+    advance(client, 0)
+    assert [r["seq"] for r in client.get("/egress", params={"flow_id": "f1"}).json()["egress"]] == list(range(1, 21))
+    assert client.get("/egress", params={"flow_id": "f2"}).json()["egress"] == [
+        {"order": 21, "flow_id": "f2", "seq": 1, "queue_id": 0}
+    ]
+    # 单条流的 delivered 字段范围也照旧
+    assert client.get("/flows/f1").json()["delivered"] == list(range(1, 21))
+
+
+def test_duplicate_and_stale_with_history_on_disk(client):
+    # 交付 1..4 和 6..10（跳过 5），把早先的交付记录挤出内存摘要窗口
+    for seq in (1, 2, 3, 4, 6, 7, 8, 9, 10):
+        send(client, "f1", seq, 0)
+        advance(client, 0)
+    # 交付过的老包仍报重复（靠磁盘记录判定）
+    resp = send(client, "f1", 1, 0)
+    assert resp.status_code == 409 and resp.json()["reason"] == "duplicate"
+    # 包号低于最新交付但从未交付的仍报过期
+    resp = send(client, "f1", 5, 0)
+    assert resp.status_code == 409 and resp.json()["reason"] == "stale"
+
+
+def test_advance_fails_when_store_write_fails(flaky):
+    client, store = flaky
+    send(client, "f1", 1, 0)
+    send(client, "f1", 2, 1)
+    send(client, "f2", 1, 1)
+
+    # 先成功交付 f2 的 1 号包
+    out = advance(client, 1, count=10).json()
+    assert [(d["flow_id"], d["seq"]) for d in out["delivered"]] == [("f2", 1)]
+
+    store.fail_writes = True
+    resp = advance(client, 0, count=10)
+    assert resp.status_code == 500
+    assert "写盘失败" in resp.json()["detail"]
+
+    # 整批包留在各自的接收队列，其他队列的同流后续包继续等候
+    state = client.get("/state").json()
+    f1 = next(s for s in state["streams"] if s["flow_id"] == "f1")
+    assert f1["pending_count"] == 2
+    assert advance(client, 1, count=10).json()["delivered"] == []
+
+    # 写盘尚未提交时，/egress 仍返回此前成功的交付记录
+    assert client.get("/egress").json()["egress"] == [
+        {"order": 1, "flow_id": "f2", "seq": 1, "queue_id": 1}
+    ]
+
+    # 写盘恢复后可重试，交付序号接着上次成功记录
+    store.fail_writes = False
+    out = advance(client, 0, count=10).json()
+    assert [(d["flow_id"], d["seq"]) for d in out["delivered"]] == [("f1", 1)]
+    out = advance(client, 1, count=10).json()
+    assert [(d["flow_id"], d["seq"]) for d in out["delivered"]] == [("f1", 2)]
+    assert [
+        (r["order"], r["flow_id"], r["seq"])
+        for r in client.get("/egress").json()["egress"]
+    ] == [(1, "f2", 1), (2, "f1", 1), (3, "f1", 2)]
